@@ -1,0 +1,4 @@
+python-telegram-bot==22.8
+Telethon==1.44.0
+colorama>=0.4.6
+tqdm>=4.67.0
