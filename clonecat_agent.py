@@ -16,7 +16,13 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    FloodWaitError,
+)
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.tl.types import Channel, Chat
@@ -78,6 +84,7 @@ state = {
 tg_client = None
 pending_phone = None
 pending_phone_code_hash = None
+pending_code_sent_at = None
 
 
 def authorized(update: Update) -> bool:
@@ -156,6 +163,10 @@ async def save_session():
 
 async def get_chat_info(chat_id: int):
     client = await ensure_client()
+    if not isinstance(chat_id, int):
+        raise ValueError("O ID deve ser um número inteiro.")
+    # IDs de supergrupos/canais normalmente aparecem como -100xxxxxxxxxx.
+    # Não removemos o sinal: ele faz parte do identificador.
     entity = await client.get_entity(chat_id)
     if isinstance(entity, Chat):
         kind = "Grupo"
@@ -230,6 +241,10 @@ async def connect_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await account_connected():
         await update.effective_message.reply_text("🟢 Sua conta já está conectada.")
         return
+    global pending_phone, pending_phone_code_hash, pending_code_sent_at
+    pending_phone = None
+    pending_phone_code_hash = None
+    pending_code_sent_at = None
     state["step"] = "phone"
     await update.effective_message.reply_text("📱 Envie o número da sua conta Telegram com código do país, por exemplo `+258...`.", parse_mode="Markdown")
 
@@ -392,22 +407,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if state["step"] == "phone":
             client = await ensure_client()
-            sent = await client.send_code_request(text)
+            try:
+                sent = await client.send_code_request(text)
+            except PhoneNumberInvalidError:
+                return await update.message.reply_text("❌ Número inválido. Envie o número com código do país, por exemplo +258...")
+            except FloodWaitError as exc:
+                return await update.message.reply_text(f"⏳ O Telegram pediu para aguardar {exc.seconds}s antes de solicitar outro código.")
             pending_phone = text
             pending_phone_code_hash = sent.phone_code_hash
+            pending_code_sent_at = asyncio.get_running_loop().time()
             state["step"] = "code"
-            await update.message.reply_text("🔐 Envie o código de login que o Telegram enviou para sua conta.")
+            await update.message.reply_text(
+                "🔐 Envie o código de login **novo** que o Telegram acabou de enviar.\n\n"
+                "Se ele expirar, envie /connect para iniciar uma nova tentativa.",
+                parse_mode="Markdown",
+            )
             return
 
         if state["step"] == "code":
             client = await ensure_client()
             try:
+                if not pending_phone or not pending_phone_code_hash:
+                    state["step"] = "phone"
+                    return await update.message.reply_text("⚠️ A tentativa de login expirou. Envie novamente o seu número.")
                 await client.sign_in(phone=pending_phone, code=text, phone_code_hash=pending_phone_code_hash)
+            except PhoneCodeExpiredError:
+                pending_phone = None
+                pending_phone_code_hash = None
+                pending_code_sent_at = None
+                state["step"] = "phone"
+                return await update.message.reply_text(
+                    "⌛ O código expirou. Envie novamente o número para receber **um código novo**.",
+                    parse_mode="Markdown",
+                )
+            except PhoneCodeInvalidError:
+                return await update.message.reply_text("❌ Código incorreto. Envie o código atual novamente.")
             except SessionPasswordNeededError:
                 state["step"] = "password"
                 await update.message.reply_text("🔑 Sua conta usa verificação em duas etapas. Envie a senha 2FA.")
                 return
             await save_session()
+            pending_phone = None
+            pending_phone_code_hash = None
+            pending_code_sent_at = None
             state["step"] = "idle"
             await update.message.reply_text("🟢 Conta conectada e sessão salva no Volume do Railway.", reply_markup=main_keyboard())
             return
@@ -421,8 +463,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if state["step"] == "origin":
-            origin = int(text)
-            entity, title, kind = await get_chat_info(origin)
+            try:
+                origin = int(text, 10)
+            except ValueError:
+                return await update.message.reply_text("❌ ID inválido. Envie somente o número, incluindo o sinal - se houver (ex.: -1001234567890).")
+            try:
+                entity, title, kind = await get_chat_info(origin)
+            except Exception as exc:
+                logging.exception("Erro acessando origem %s: %s", origin, exc)
+                return await update.message.reply_text(f"❌ Não consegui acessar o grupo de origem `{origin}`.\n\nDetalhes: `{exc}`", parse_mode="Markdown")
             state["origin"] = origin
             state["origin_title"] = title
             state["step"] = "destination"
@@ -434,8 +483,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if state["step"] == "destination":
-            destination = int(text)
-            entity, topics = await list_topics(destination)
+            try:
+                destination = int(text, 10)
+            except ValueError:
+                return await update.message.reply_text("❌ ID inválido. Envie somente o número, incluindo o sinal - se houver (ex.: -1001234567890).")
+            try:
+                entity, topics = await list_topics(destination)
+            except Exception as exc:
+                logging.exception("Erro acessando destino %s: %s", destination, exc)
+                return await update.message.reply_text(f"❌ Não consegui acessar/listar os tópicos do destino `{destination}`.\n\nDetalhes: `{exc}`", parse_mode="Markdown")
             state["destination"] = entity.id
             state["destination_title"] = getattr(entity, "title", "Sem nome")
             state["topics"] = topics
@@ -454,12 +510,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("Use /start para abrir o menu.")
-    except ValueError:
-        await update.message.reply_text("❌ Valor inválido. Envie um ID numérico válido.")
     except Exception as exc:
         logging.exception("Erro no fluxo: %s", exc)
         await update.message.reply_text(f"❌ Erro: {exc}")
-        state["step"] = "idle"
 
 
 async def launch_clone(message, resume=False):
@@ -506,8 +559,28 @@ async def launch_clone(message, resume=False):
         await message.edit_message_text(f"❌ Não foi possível iniciar a clonagem: {exc}")
 
 
+async def drain_process_output(proc):
+    """Consome stdout do clonecat para evitar bloqueio do buffer do subprocesso."""
+    lines = []
+    try:
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip()
+            if line:
+                lines.append(line)
+                if len(lines) > 80:
+                    lines.pop(0)
+                logging.info("clonecat: %s", line)
+    except Exception as exc:
+        logging.exception("Erro lendo saída do clonecat: %s", exc)
+    return lines
+
+
 async def monitor_job(proc, message):
     last_text = ""
+    output_task = asyncio.create_task(drain_process_output(proc))
     while proc.returncode is None:
         await asyncio.sleep(15)
         resume = load_resume(state.get("origin")) if state.get("origin") else None
@@ -531,6 +604,10 @@ async def monitor_job(proc, message):
                 last_text = text
 
     rc = await proc.wait()
+    try:
+        output_lines = await output_task
+    except Exception:
+        output_lines = []
 
     # Se o processo morreu inesperadamente, aproveita o resume e tenta
     # continuar automaticamente. Uma parada solicitada pelo usuário não é reiniciada.
@@ -572,7 +649,12 @@ async def monitor_job(proc, message):
     if rc == 0:
         summary = "✅ **Clonagem concluída.**"
     else:
-        summary = f"⚠️ **O processo terminou com código {rc}.**\nO `resume_forum.json` permanece salvo para continuar."
+        tail = "\n".join(output_lines[-12:]) if output_lines else "(sem saída capturada)"
+        summary = (
+            f"⚠️ **O processo terminou com código {rc}.**\n"
+            "O `resume_forum.json` permanece salvo para continuar.\n\n"
+            f"**Últimas linhas do processo:**\n```\n{tail}\n```"
+        )
     if resume:
         summary += (
             f"\n\nEnviadas: {resume.get('cloned_count', 0)}"
